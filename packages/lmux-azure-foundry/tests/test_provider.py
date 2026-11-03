@@ -226,7 +226,12 @@ def responses_params() -> AzureFoundryParams:
 def tool_loop_messages() -> list[Message]:
     continuation = ProviderContinuation(
         namespace="lmux_azure_foundry.responses",
-        data={"output": [{"type": "reasoning", "id": "rs_1", "encrypted_content": "enc"}]},
+        data={
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc"},
+                {"type": "function_call", "call_id": "call_1", "name": "lab", "arguments": "{}"},
+            ]
+        },
     )
     call = ToolCall(id="call_1", function=FunctionCallResult(name="lab", arguments="{}"))
     return [
@@ -267,6 +272,7 @@ def expected_responses_request() -> dict[str, Any]:
         "input": [
             {"role": "user", "content": "LDL?"},
             {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc"},
+            {"type": "function_call", "call_id": "call_1", "name": "lab", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_1", "output": "141"},
         ],
         "stream": False,
@@ -278,7 +284,7 @@ def expected_responses_request() -> dict[str, Any]:
         "tools": [{"type": "function", "name": "lab", "strict": False}],
         "tool_choice": {"type": "function", "name": "lab"},
         "text": {"format": {"type": "json_object"}},
-        "reasoning": {"effort": "medium"},
+        "reasoning": {"effort": "medium", "summary": "auto"},
     }
 
 
@@ -663,6 +669,29 @@ class TestChat:
         assert route.called
         assert not responses_route.called
 
+    def test_responses_api_deployment_multiplier(
+        self, sync_provider: AzureFoundryProvider, respx_mock: respx.MockRouter
+    ) -> None:
+        body = {
+            "id": "r",
+            "model": "gpt-6-luna",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "Hi"}]}],
+            "usage": {"input_tokens": 1000, "output_tokens": 100},
+        }
+        respx_mock.post(RESPONSES_URL).mock(return_value=httpx.Response(200, json=body))
+        global_cost = sync_provider.chat(
+            "gpt-6-luna", [UserMessage(content="Hi")], provider_params=AzureFoundryParams(api="responses")
+        ).cost
+        regional_cost = sync_provider.chat(
+            "gpt-6-luna",
+            [UserMessage(content="Hi")],
+            provider_params=AzureFoundryParams(api="responses", deployment_type="regional"),
+        ).cost
+        assert global_cost is not None
+        assert regional_cost is not None
+        assert regional_cost.total_cost == pytest.approx(global_cost.total_cost * 1.1)
+
 
 # MARK: Achat
 
@@ -856,7 +885,7 @@ class TestChatStream:
             "stream": True,
             "store": False,
             "include": ["reasoning.encrypted_content"],
-            "reasoning": {"effort": "medium"},
+            "reasoning": {"effort": "medium", "summary": "auto"},
         }
 
     def test_responses_api_error_event(

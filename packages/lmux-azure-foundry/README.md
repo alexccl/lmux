@@ -95,8 +95,8 @@ messages.append(response.to_assistant_message())
 
 Requests are stateless (`store: false`). The model's encrypted reasoning comes back on
 `response.continuation`; keep it on the assistant message (as `to_assistant_message()` does) and the next
-call replays it. `chat_stream`/`achat_stream` take the same parameter; `stop` and `seed` are not supported on this
-path.
+call replays it. A continuation is only replayed on this path; the same history sent through Chat Completions drops
+the reasoning. `chat_stream`/`achat_stream` take the same parameter; `stop` and `seed` are not supported here.
 
 ### Async
 

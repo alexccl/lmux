@@ -600,6 +600,9 @@ class AzureFoundryProvider(
         if reasoning_effort is not None:
             body["reasoning"] = {"effort": reasoning_effort}
         body.update(AzureFoundryProvider._responses_kwargs(provider_params))
+        if "reasoning" in body:
+            # Summaries come back only when requested; they fill ``reasoning`` / ``reasoning_delta``.
+            body["reasoning"] = {**body["reasoning"], "summary": "auto"}
         return body
 
     @staticmethod
