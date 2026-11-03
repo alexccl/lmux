@@ -1,8 +1,9 @@
 """Pydantic wire models for Azure AI Foundry (OpenAI-compatible) response bodies.
 
 Only the fields lmux consumes are declared; unknown fields are ignored (Pydantic's default),
-so new server fields do not break parsing. Covers the three response families the provider
-reads: chat completions (and streaming chunks), embeddings, and the Responses API.
+so new server fields do not break parsing. Responses API output items are the exception: they keep
+unknown fields so a turn can be replayed to the API as it was returned. Covers the three response
+families the provider reads: chat completions (and streaming chunks), embeddings, and the Responses API.
 """
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -107,9 +108,6 @@ class WireEmbeddingResponse(BaseModel):
 # MARK: Responses API
 
 
-# Output items keep unknown fields so a turn can be replayed to the API as it was returned.
-
-
 class WireOutputContent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -156,10 +154,32 @@ class WireIncompleteDetails(BaseModel):
     reason: str | None = None
 
 
+class WireResponsesError(BaseModel):
+    message: str | None = None
+    code: str | None = None
+
+
 class WireResponsesResponse(BaseModel):
     id: str
     model: str
     status: str | None = None
     incomplete_details: WireIncompleteDetails | None = None
+    error: WireResponsesError | None = None
     output: list[WireOutputItem] | None = None
     usage: WireResponsesUsage | None = None
+
+
+# MARK: Responses API streaming
+
+
+class WireResponsesStreamEvent(BaseModel):
+    """One Responses API stream event; which fields are set depends on ``type``."""
+
+    type: str
+    delta: str | None = None
+    output_index: int | None = None
+    item: WireOutputItem | None = None
+    response: WireResponsesResponse | None = None
+    # top-level ``error`` events
+    message: str | None = None
+    code: str | None = None

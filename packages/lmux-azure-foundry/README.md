@@ -95,7 +95,8 @@ messages.append(response.to_assistant_message())
 
 Requests are stateless (`store: false`). The model's encrypted reasoning comes back on
 `response.continuation`; keep it on the assistant message (as `to_assistant_message()` does) and the next
-call replays it. `chat_stream`/`achat_stream` take the same parameter; `stop` is not supported on this path.
+call replays it. `chat_stream`/`achat_stream` take the same parameter; `stop` and `seed` are not supported on this
+path.
 
 ### Async
 
@@ -127,7 +128,6 @@ response = provider.chat(
 
 | Parameter                | Type                                    | Description                                                       |
 | ------------------------ | --------------------------------------- | ----------------------------------------------------------------- |
-| `api`                    | `"chat_completions" \| "responses"`     | Endpoint chat calls use; not sent to API                          |
 | `reasoning_effort`       | `"low" \| "medium" \| "high"`           | Reasoning effort for o-series models                              |
 | `seed`                   | `int`                                   | Deterministic sampling seed                                       |
 | `user`                   | `str`                                   | End-user identifier                                               |
@@ -135,6 +135,7 @@ response = provider.chat(
 | `prompt_cache_retention` | `"in_memory" \| "24h"`                  | Prompt cache retention policy (chat + responses)                  |
 | `deployment_type`        | `"global" \| "data_zone" \| "regional"` | Affects cost calculation only, not sent to API                    |
 | `data_zone`              | `"us" \| "eu"`                          | Pricing zone for Data Zone deployments; defaults to `"us"`        |
+| `api`                    | `"chat_completions" \| "responses"`     | Endpoint chat calls use; not sent to API                          |
 
 `deployment_type="data_zone"` uses US pricing when `data_zone` is omitted. Set `data_zone="eu"` for an EU
 Data Zone deployment. This selects the applicable model-specific premium for cost reporting; it does not

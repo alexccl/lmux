@@ -8,7 +8,7 @@ import copy
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 
-from lmux.exceptions import InvalidRequestError, UnsupportedFeatureError
+from lmux.exceptions import InvalidRequestError
 from lmux.schema import add_additional_properties_false
 from lmux.types import (
     AssistantMessage,
@@ -26,6 +26,8 @@ from lmux.types import (
     Message,
     ProviderContinuation,
     ResponseFormat,
+    ResponseInputFunctionCall,
+    ResponseInputFunctionCallOutput,
     ResponseInputItem,
     ResponseInputMessage,
     ResponseResponse,
@@ -48,6 +50,7 @@ from lmux_azure_foundry._wire import (
     WireEmbeddingResponse,
     WireOutputItem,
     WireResponsesResponse,
+    WireResponsesStreamEvent,
     WireResponsesUsage,
     WireToolCallDelta,
 )
@@ -55,9 +58,8 @@ from lmux_azure_foundry._wire import (
 type CostCalculator = Callable[[str, Usage], Cost | None]
 type Json = dict[str, Any]
 
-CONTINUATION_NAMESPACE = "lmux_azure_foundry.responses"
-_PROVIDER = "azure-foundry"
-_INCOMPLETE_FINISH_REASONS = {"max_output_tokens": "length", "content_filter": "content_filter"}
+_CONTINUATION_NAMESPACE = "lmux_azure_foundry.responses"
+_INCOMPLETE_FINISH_REASONS: dict[str, str] = {"max_output_tokens": "length", "content_filter": "content_filter"}
 
 
 # MARK: Input Mappers (lmux -> OpenAI-compatible JSON)
@@ -151,29 +153,25 @@ def map_response_input(input: str | Sequence[ResponseInputItem]) -> str | list[J
     """Convert lmux ResponseInputItem sequence to OpenAI-compatible dicts."""
     if isinstance(input, str):
         return input
-    result: list[Json] = []
-    for item in input:
-        if not isinstance(item, ResponseInputMessage):
-            result.append(item.model_dump(exclude_none=True))
-            continue
-        if isinstance(item.content, str):
-            content: str | list[Json] = item.content
-        else:
-            content = [
-                _map_response_content_part(part) for part in item.content if not isinstance(part, CachePointContent)
-            ]
-        if isinstance(content, str) or content or not item.content:
-            result.append({"role": item.role, "content": content})
-    return result
+    return [mapped for item in input if (mapped := _map_response_input_item(item)) is not None]
+
+
+def _map_response_input_item(item: ResponseInputItem) -> Json | None:
+    """Map one input item; None for a message that held only cache points."""
+    if not isinstance(item, ResponseInputMessage):
+        return item.model_dump(exclude_none=True)
+    if isinstance(item.content, str):
+        return {"role": item.role, "content": item.content}
+    content = [_map_response_content_part(part) for part in item.content if not isinstance(part, CachePointContent)]
+    if content or not item.content:
+        return {"role": item.role, "content": content}
+    return None
 
 
 def _map_response_content_part(part: TextContent | ImageContent) -> Json:
     if isinstance(part, TextContent):
         return {"type": "input_text", "text": part.text}
     return {"type": "input_image", "image_url": part.url, "detail": part.detail}
-
-
-# MARK: Chat over the Responses API (lmux -> Responses JSON)
 
 
 def map_messages_to_response_input(messages: Sequence[Message]) -> list[Json]:
@@ -185,46 +183,39 @@ def map_messages_to_response_input(messages: Sequence[Message]) -> list[Json]:
     """
     result: list[Json] = []
     for msg in messages:
-        if isinstance(msg, SystemMessage | DeveloperMessage):
-            result.append({"role": msg.role, "content": msg.content})
-        elif isinstance(msg, UserMessage):
-            content = _map_response_user_content(msg.content)
-            if isinstance(content, list) and not content and msg.content:
-                continue  # message held only cache points, which this provider has no representation for
-            result.append({"role": "user", "content": content})
-        elif isinstance(msg, AssistantMessage):
-            result.extend(_map_response_assistant(msg))
-        else:
-            result.append(_map_response_tool_output(msg))
+        if isinstance(msg, AssistantMessage) and (replayed := _replayed_output(msg)) is not None:
+            result.extend(replayed)
+            continue
+        result.extend(
+            mapped for item in _to_response_input_items(msg) if (mapped := _map_response_input_item(item)) is not None
+        )
     return result
 
 
-def _map_response_user_content(content: str | list[ContentPart]) -> str | list[Json]:
-    if isinstance(content, str):
-        return content
-    return [_map_response_content_part(part) for part in content if not isinstance(part, CachePointContent)]
-
-
-def _map_response_assistant(msg: AssistantMessage) -> list[Json]:
+def _replayed_output(msg: AssistantMessage) -> list[Json] | None:
     continuation = msg.continuation
-    if continuation is not None and continuation.namespace == CONTINUATION_NAMESPACE:
-        items = continuation.data.get("output")
-        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-            error_message = "Azure Foundry continuation data must contain a list of output items"
-            raise InvalidRequestError(error_message, provider=_PROVIDER)
-        return copy.deepcopy(cast("list[Json]", items))
-    items: list[Json] = []
+    if continuation is None or continuation.namespace != _CONTINUATION_NAMESPACE:
+        return None
+    items = continuation.data.get("output")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        error_message = "Azure Foundry continuation data must contain a list of output items"
+        raise InvalidRequestError(error_message, provider="azure-foundry")
+    return copy.deepcopy(cast("list[Json]", items))
+
+
+def _to_response_input_items(msg: Message) -> list[ResponseInputItem]:
+    if isinstance(msg, SystemMessage | DeveloperMessage | UserMessage):
+        return [ResponseInputMessage(role=msg.role, content=msg.content)]
+    if isinstance(msg, ToolMessage):
+        return [ResponseInputFunctionCallOutput(call_id=msg.tool_call_id, output=msg.content)]
+    items: list[ResponseInputItem] = []
     if msg.content:
-        items.append({"role": "assistant", "content": msg.content})
+        items.append(ResponseInputMessage(role="assistant", content=msg.content))
     items.extend(
-        {"type": "function_call", "call_id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+        ResponseInputFunctionCall(call_id=tc.id, name=tc.function.name, arguments=tc.function.arguments)
         for tc in msg.tool_calls or []
     )
     return items
-
-
-def _map_response_tool_output(msg: ToolMessage) -> Json:
-    return {"type": "function_call_output", "call_id": msg.tool_call_id, "output": msg.content}
 
 
 def map_response_tools(tools: list[Tool]) -> list[Json]:
@@ -263,13 +254,6 @@ def map_response_text_format(rf: ResponseFormat) -> Json:
     if rf.strict is not None:
         fmt["strict"] = rf.strict
     return fmt
-
-
-def reject_stop_for_responses(stop: str | list[str] | None) -> None:
-    """The Responses API has no stop sequences."""
-    if stop is not None:
-        msg = "stop sequences are not supported when chat runs over the Responses API"
-        raise UnsupportedFeatureError(msg, provider=_PROVIDER)
 
 
 # MARK: Output Mappers (Azure Foundry wire models -> lmux)
@@ -429,7 +413,7 @@ def map_responses_chat(response: WireResponsesResponse, provider_name: str, cost
     continuation = None
     if any(item.type == "reasoning" for item in output):
         continuation = ProviderContinuation(
-            namespace=CONTINUATION_NAMESPACE,
+            namespace=_CONTINUATION_NAMESPACE,
             data={"output": [item.model_dump(mode="json", exclude_none=True) for item in output]},
         )
     usage = _map_responses_usage(response.usage)
@@ -465,31 +449,37 @@ class ResponsesStreamMapper:
         self._provider_name = provider_name
         self._cost_fn = cost_fn
         self._tool_index: dict[int, int] = {}
+        self._summary_parts = 0
 
-    def map_event(self, event: Json) -> ChatChunk | None:
+    def map_event(self, event: WireResponsesStreamEvent) -> ChatChunk | None:
         """Return the chunk for one stream event, or None for events that carry nothing to emit."""
-        kind = event.get("type")
+        kind = event.type
         if kind == "response.output_text.delta":
-            return ChatChunk(delta=event["delta"], provider=self._provider_name)
+            return ChatChunk(delta=event.delta, provider=self._provider_name)
+        if kind == "response.reasoning_summary_part.added":
+            # Summary parts are joined with a blank line, as in the non-streamed response.
+            self._summary_parts += 1
+            return ChatChunk(reasoning_delta="\n\n", provider=self._provider_name) if self._summary_parts > 1 else None
         if kind == "response.reasoning_summary_text.delta":
-            return ChatChunk(reasoning_delta=event["delta"], provider=self._provider_name)
-        if kind == "response.output_item.added" and event["item"].get("type") == "function_call":
-            item = event["item"]
-            index = self._tool_index.setdefault(event["output_index"], len(self._tool_index))
-            delta = ToolCallDelta(
-                index=index,
-                id=item["call_id"],
+            return ChatChunk(reasoning_delta=event.delta, provider=self._provider_name)
+        if kind in {"response.completed", "response.incomplete"} and event.response is not None:
+            return self._final_chunk(event.response)
+        delta = self._tool_call_delta(event)
+        return ChatChunk(tool_call_deltas=[delta], provider=self._provider_name) if delta is not None else None
+
+    def _tool_call_delta(self, event: WireResponsesStreamEvent) -> ToolCallDelta | None:
+        item = event.item
+        if event.type == "response.output_item.added" and item is not None and item.type == "function_call":
+            return ToolCallDelta(
+                index=self._tool_index.setdefault(event.output_index or 0, len(self._tool_index)),
+                id=item.call_id,
                 type="function",
-                function=FunctionCallDelta(name=item["name"], arguments=item.get("arguments") or None),
+                function=FunctionCallDelta(name=item.name, arguments=item.arguments or None),
             )
-            return ChatChunk(tool_call_deltas=[delta], provider=self._provider_name)
-        if kind == "response.function_call_arguments.delta" and event["output_index"] in self._tool_index:
-            delta = ToolCallDelta(
-                index=self._tool_index[event["output_index"]], function=FunctionCallDelta(arguments=event["delta"])
+        if event.type == "response.function_call_arguments.delta" and event.output_index in self._tool_index:
+            return ToolCallDelta(
+                index=self._tool_index[event.output_index], function=FunctionCallDelta(arguments=event.delta)
             )
-            return ChatChunk(tool_call_deltas=[delta], provider=self._provider_name)
-        if kind in {"response.completed", "response.incomplete"}:
-            return self._final_chunk(WireResponsesResponse.model_validate(event["response"]))
         return None
 
     def _final_chunk(self, response: WireResponsesResponse) -> ChatChunk:
@@ -502,14 +492,3 @@ class ResponsesStreamMapper:
             provider=self._provider_name,
             continuation=done.continuation,
         )
-
-
-def responses_stream_error(event: Json) -> Json | None:
-    """Return an error payload in the shape ``error_from_stream`` reads, if the event is a failure."""
-    kind = event.get("type")
-    if kind == "error":
-        return {"error": {"message": event.get("message"), "code": event.get("code")}}
-    if kind == "response.failed":
-        error = (event.get("response") or {}).get("error") or {"message": "response failed"}
-        return {"error": error}
-    return None

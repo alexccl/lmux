@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 from lmux._http import aiter_sse, iter_sse
 from lmux.cost import ModelPricing, calculate_cost
-from lmux.exceptions import LmuxError
+from lmux.exceptions import LmuxError, UnsupportedFeatureError
 from lmux.protocols import AuthProvider, CompletionProvider, EmbeddingProvider, PricingProvider, ResponsesProvider
 from lmux.types import (
     ChatChunk,
@@ -27,6 +27,7 @@ from lmux.types import (
 )
 from lmux_azure_foundry._exceptions import (
     error_from_response,
+    error_from_responses_event,
     error_from_stream,
     map_transport_error,
     parse_body,
@@ -49,14 +50,13 @@ from lmux_azure_foundry._mappers import (
     map_responses_response,
     map_tool_choice,
     map_tools,
-    reject_stop_for_responses,
-    responses_stream_error,
 )
 from lmux_azure_foundry._wire import (
     WireChunk,
     WireCompletion,
     WireEmbeddingResponse,
     WireResponsesResponse,
+    WireResponsesStreamEvent,
 )
 from lmux_azure_foundry.auth import AzureFoundryCredential, AzureFoundryKeyAuthProvider
 from lmux_azure_foundry.cost import (
@@ -477,10 +477,11 @@ class AzureFoundryProvider(
 
         mapper = ResponsesStreamMapper(PROVIDER_NAME, self._calculate_cost)
 
-        def map_responses_event(event: dict[str, Any]) -> ChatChunk | None:
-            error = responses_stream_error(event)
+        def map_responses_event(data: dict[str, Any]) -> ChatChunk | None:
+            event = WireResponsesStreamEvent.model_validate(data)
+            error = error_from_responses_event(event)
             if error is not None:
-                raise error_from_stream(error)
+                raise error
             chunk = mapper.map_event(event)
             if chunk is None or chunk.cost is None or chunk.model is None:
                 return chunk
@@ -574,7 +575,9 @@ class AzureFoundryProvider(
         provider_params: AzureFoundryParams | None,
     ) -> dict[str, Any]:
         """Chat request body for the Responses API, stateless: reasoning comes back encrypted for replay."""
-        reject_stop_for_responses(stop)
+        if stop is not None or (provider_params is not None and provider_params.seed is not None):
+            msg = "stop and seed are not supported when chat runs over the Responses API"
+            raise UnsupportedFeatureError(msg, provider=PROVIDER_NAME)
         body: dict[str, Any] = {
             "model": model,
             "input": map_messages_to_response_input(messages),
