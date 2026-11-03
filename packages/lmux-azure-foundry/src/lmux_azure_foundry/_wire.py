@@ -5,7 +5,7 @@ so new server fields do not break parsing. Covers the three response families th
 reads: chat completions (and streaming chunks), embeddings, and the Responses API.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # MARK: Chat completion (non-streamed)
 
@@ -107,14 +107,34 @@ class WireEmbeddingResponse(BaseModel):
 # MARK: Responses API
 
 
+# Output items keep unknown fields so a turn can be replayed to the API as it was returned.
+
+
 class WireOutputContent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    text: str | None = None
+
+
+class WireSummaryPart(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str
     text: str | None = None
 
 
 class WireOutputItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str
     content: list[WireOutputContent] | None = None
+    # function_call items
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str | None = None
+    # reasoning items
+    summary: list[WireSummaryPart] | None = None
 
 
 class WireResponsesInputDetails(BaseModel):
@@ -132,8 +152,14 @@ class WireResponsesUsage(BaseModel):
     output_tokens_details: WireResponsesOutputDetails | None = None
 
 
+class WireIncompleteDetails(BaseModel):
+    reason: str | None = None
+
+
 class WireResponsesResponse(BaseModel):
     id: str
     model: str
+    status: str | None = None
+    incomplete_details: WireIncompleteDetails | None = None
     output: list[WireOutputItem] | None = None
     usage: WireResponsesUsage | None = None

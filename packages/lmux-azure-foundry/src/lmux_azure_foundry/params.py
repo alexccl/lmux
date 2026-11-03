@@ -8,6 +8,15 @@ from lmux.types import BaseProviderParams
 class AzureFoundryParams(BaseProviderParams):
     """Provider-specific parameters for Azure AI Foundry API calls."""
 
+    api: Literal["chat_completions", "responses"] | None = None
+    """Which Azure endpoint the chat methods call, streamed or not. Not sent to the API.
+
+    - ``None`` / ``"chat_completions"`` — ``/chat/completions`` (default).
+    - ``"responses"`` — ``/responses``, mapped to and from the chat types. Needed for models that refuse
+      function tools with reasoning on Chat Completions (GPT-6). The model's reasoning comes back as the
+      response's ``continuation``; pass the assistant turn back with it unchanged and the next round
+      replays it. ``stop`` is not supported on this path.
+    """
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     seed: int | None = None
     user: str | None = None

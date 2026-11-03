@@ -6,8 +6,9 @@ the raw JSON dicts returned by the REST API (not SDK objects).
 
 import copy
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
+from lmux.exceptions import InvalidRequestError, UnsupportedFeatureError
 from lmux.schema import add_additional_properties_false
 from lmux.types import (
     AssistantMessage,
@@ -23,6 +24,7 @@ from lmux.types import (
     ImageContent,
     JsonObjectResponseFormat,
     Message,
+    ProviderContinuation,
     ResponseFormat,
     ResponseInputItem,
     ResponseInputMessage,
@@ -35,6 +37,7 @@ from lmux.types import (
     ToolCallDelta,
     ToolChoice,
     ToolChoiceFunction,
+    ToolMessage,
     Usage,
     UserMessage,
 )
@@ -51,6 +54,10 @@ from lmux_azure_foundry._wire import (
 
 type CostCalculator = Callable[[str, Usage], Cost | None]
 type Json = dict[str, Any]
+
+CONTINUATION_NAMESPACE = "lmux_azure_foundry.responses"
+_PROVIDER = "azure-foundry"
+_INCOMPLETE_FINISH_REASONS = {"max_output_tokens": "length", "content_filter": "content_filter"}
 
 
 # MARK: Input Mappers (lmux -> OpenAI-compatible JSON)
@@ -164,6 +171,105 @@ def _map_response_content_part(part: TextContent | ImageContent) -> Json:
     if isinstance(part, TextContent):
         return {"type": "input_text", "text": part.text}
     return {"type": "input_image", "image_url": part.url, "detail": part.detail}
+
+
+# MARK: Chat over the Responses API (lmux -> Responses JSON)
+
+
+def map_messages_to_response_input(messages: Sequence[Message]) -> list[Json]:
+    """Convert lmux chat Messages to Responses API input items.
+
+    An assistant turn that carries this provider's continuation is replayed as the output items the
+    API returned for it (reasoning, function calls, message), so the model keeps its reasoning across
+    a tool loop. Other assistant turns are rebuilt from their text and tool calls.
+    """
+    result: list[Json] = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage | DeveloperMessage):
+            result.append({"role": msg.role, "content": msg.content})
+        elif isinstance(msg, UserMessage):
+            content = _map_response_user_content(msg.content)
+            if isinstance(content, list) and not content and msg.content:
+                continue  # message held only cache points, which this provider has no representation for
+            result.append({"role": "user", "content": content})
+        elif isinstance(msg, AssistantMessage):
+            result.extend(_map_response_assistant(msg))
+        else:
+            result.append(_map_response_tool_output(msg))
+    return result
+
+
+def _map_response_user_content(content: str | list[ContentPart]) -> str | list[Json]:
+    if isinstance(content, str):
+        return content
+    return [_map_response_content_part(part) for part in content if not isinstance(part, CachePointContent)]
+
+
+def _map_response_assistant(msg: AssistantMessage) -> list[Json]:
+    continuation = msg.continuation
+    if continuation is not None and continuation.namespace == CONTINUATION_NAMESPACE:
+        items = continuation.data.get("output")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            error_message = "Azure Foundry continuation data must contain a list of output items"
+            raise InvalidRequestError(error_message, provider=_PROVIDER)
+        return copy.deepcopy(cast("list[Json]", items))
+    items: list[Json] = []
+    if msg.content:
+        items.append({"role": "assistant", "content": msg.content})
+    items.extend(
+        {"type": "function_call", "call_id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+        for tc in msg.tool_calls or []
+    )
+    return items
+
+
+def _map_response_tool_output(msg: ToolMessage) -> Json:
+    return {"type": "function_call_output", "call_id": msg.tool_call_id, "output": msg.content}
+
+
+def map_response_tools(tools: list[Tool]) -> list[Json]:
+    """Convert lmux Tools to Responses API function tools.
+
+    The Responses API treats an unset ``strict`` as true, unlike Chat Completions, so it is sent as
+    false unless the caller set it.
+    """
+    result: list[Json] = []
+    for tool in tools:
+        fn: Json = {"type": "function", "name": tool.function.name, "strict": bool(tool.function.strict)}
+        if tool.function.description is not None:
+            fn["description"] = tool.function.description
+        if tool.function.parameters is not None:
+            fn["parameters"] = tool.function.parameters
+        result.append(fn)
+    return result
+
+
+def map_response_tool_choice(tc: ToolChoice) -> str | Json:
+    """Convert lmux ToolChoice to the Responses API tool_choice param."""
+    if isinstance(tc, ToolChoiceFunction):
+        return {"type": "function", "name": tc.name}
+    return tc
+
+
+def map_response_text_format(rf: ResponseFormat) -> Json:
+    """Convert lmux ResponseFormat to the Responses API ``text.format`` param."""
+    if isinstance(rf, TextResponseFormat | JsonObjectResponseFormat):
+        return {"type": rf.type}
+    patched = copy.deepcopy(rf.json_schema)
+    add_additional_properties_false(patched)
+    fmt: Json = {"type": "json_schema", "name": rf.name, "schema": patched}
+    if rf.description is not None:
+        fmt["description"] = rf.description
+    if rf.strict is not None:
+        fmt["strict"] = rf.strict
+    return fmt
+
+
+def reject_stop_for_responses(stop: str | list[str] | None) -> None:
+    """The Responses API has no stop sequences."""
+    if stop is not None:
+        msg = "stop sequences are not supported when chat runs over the Responses API"
+        raise UnsupportedFeatureError(msg, provider=_PROVIDER)
 
 
 # MARK: Output Mappers (Azure Foundry wire models -> lmux)
@@ -303,3 +409,107 @@ def _extract_output_text(output: list[WireOutputItem]) -> str:
         for content in item.content or []
         if content.type == "output_text"
     )
+
+
+def map_responses_chat(response: WireResponsesResponse, provider_name: str, cost_fn: CostCalculator) -> ChatResponse:
+    """Convert a Responses API response to an lmux ChatResponse.
+
+    When the output holds reasoning items, the whole output is kept as the continuation, since the
+    API needs reasoning items replayed alongside the function calls that followed them.
+    """
+    output = response.output or []
+    tool_calls = [
+        ToolCall(id=item.call_id, function=FunctionCallResult(name=item.name, arguments=item.arguments or ""))
+        for item in output
+        if item.type == "function_call" and item.call_id is not None and item.name is not None
+    ]
+    summary = "\n\n".join(
+        part.text for item in output if item.type == "reasoning" for part in item.summary or [] if part.text
+    )
+    continuation = None
+    if any(item.type == "reasoning" for item in output):
+        continuation = ProviderContinuation(
+            namespace=CONTINUATION_NAMESPACE,
+            data={"output": [item.model_dump(mode="json", exclude_none=True) for item in output]},
+        )
+    usage = _map_responses_usage(response.usage)
+    return ChatResponse(
+        content=_extract_output_text(output) or None,
+        reasoning=summary or None,
+        tool_calls=tool_calls or None,
+        usage=usage,
+        cost=cost_fn(response.model, usage) if usage else None,
+        model=response.model,
+        provider=provider_name,
+        finish_reason=_responses_finish_reason(response, has_tool_calls=bool(tool_calls)),
+        continuation=continuation,
+    )
+
+
+def _responses_finish_reason(response: WireResponsesResponse, *, has_tool_calls: bool) -> str:
+    if response.status == "incomplete":
+        reason = response.incomplete_details.reason if response.incomplete_details else None
+        return _INCOMPLETE_FINISH_REASONS.get(reason or "", reason or "incomplete")
+    return "tool_calls" if has_tool_calls else "stop"
+
+
+class ResponsesStreamMapper:
+    """Map Responses API stream events to lmux ChatChunks, one stream per instance.
+
+    Function calls are numbered in the order they start, which is the tool-call index
+    the chunk accumulators expect. The terminal event carries usage, the finish reason
+    and the continuation; it is the only chunk with ``cost`` set.
+    """
+
+    def __init__(self, provider_name: str, cost_fn: CostCalculator) -> None:
+        self._provider_name = provider_name
+        self._cost_fn = cost_fn
+        self._tool_index: dict[int, int] = {}
+
+    def map_event(self, event: Json) -> ChatChunk | None:
+        """Return the chunk for one stream event, or None for events that carry nothing to emit."""
+        kind = event.get("type")
+        if kind == "response.output_text.delta":
+            return ChatChunk(delta=event["delta"], provider=self._provider_name)
+        if kind == "response.reasoning_summary_text.delta":
+            return ChatChunk(reasoning_delta=event["delta"], provider=self._provider_name)
+        if kind == "response.output_item.added" and event["item"].get("type") == "function_call":
+            item = event["item"]
+            index = self._tool_index.setdefault(event["output_index"], len(self._tool_index))
+            delta = ToolCallDelta(
+                index=index,
+                id=item["call_id"],
+                type="function",
+                function=FunctionCallDelta(name=item["name"], arguments=item.get("arguments") or None),
+            )
+            return ChatChunk(tool_call_deltas=[delta], provider=self._provider_name)
+        if kind == "response.function_call_arguments.delta" and event["output_index"] in self._tool_index:
+            delta = ToolCallDelta(
+                index=self._tool_index[event["output_index"]], function=FunctionCallDelta(arguments=event["delta"])
+            )
+            return ChatChunk(tool_call_deltas=[delta], provider=self._provider_name)
+        if kind in {"response.completed", "response.incomplete"}:
+            return self._final_chunk(WireResponsesResponse.model_validate(event["response"]))
+        return None
+
+    def _final_chunk(self, response: WireResponsesResponse) -> ChatChunk:
+        done = map_responses_chat(response, self._provider_name, self._cost_fn)
+        return ChatChunk(
+            usage=done.usage,
+            cost=done.cost,
+            finish_reason=done.finish_reason,
+            model=done.model,
+            provider=self._provider_name,
+            continuation=done.continuation,
+        )
+
+
+def responses_stream_error(event: Json) -> Json | None:
+    """Return an error payload in the shape ``error_from_stream`` reads, if the event is a failure."""
+    kind = event.get("type")
+    if kind == "error":
+        return {"error": {"message": event.get("message"), "code": event.get("code")}}
+    if kind == "response.failed":
+        error = (event.get("response") or {}).get("error") or {"message": "response failed"}
+        return {"error": error}
+    return None

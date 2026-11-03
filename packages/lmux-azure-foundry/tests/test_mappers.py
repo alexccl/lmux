@@ -1,5 +1,8 @@
 """Tests for Azure AI Foundry JSON mappers."""
 
+import pytest
+
+from lmux.exceptions import InvalidRequestError, UnsupportedFeatureError
 from lmux.types import (
     AssistantMessage,
     CachePointContent,
@@ -15,6 +18,7 @@ from lmux.types import (
     ImageContent,
     JsonObjectResponseFormat,
     JsonSchemaResponseFormat,
+    ProviderContinuation,
     ResponseInputFunctionCall,
     ResponseInputMessage,
     ResponseResponse,
@@ -30,15 +34,24 @@ from lmux.types import (
     UserMessage,
 )
 from lmux_azure_foundry._mappers import (
+    CONTINUATION_NAMESPACE,
+    ResponsesStreamMapper,
     map_chat_chunk,
     map_chat_completion,
     map_embedding_response,
     map_messages,
+    map_messages_to_response_input,
     map_response_format,
     map_response_input,
+    map_response_text_format,
+    map_response_tool_choice,
+    map_response_tools,
+    map_responses_chat,
     map_responses_response,
     map_tool_choice,
     map_tools,
+    reject_stop_for_responses,
+    responses_stream_error,
 )
 from lmux_azure_foundry._wire import (
     WireChunk,
@@ -479,3 +492,316 @@ class TestMapResponsesResponse:
         result = map_responses_response(WireResponsesResponse.model_validate(response), "azure-foundry", _noop_cost)
         assert result.usage is None
         assert result.cost is None
+
+
+# MARK: chat over the Responses API
+
+REASONING_ITEM = {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc", "summary": []}
+CALL_ITEM = {
+    "type": "function_call",
+    "id": "fc_1",
+    "call_id": "call_1",
+    "name": "lab",
+    "arguments": '{"analyte":"LDL"}',
+    "status": "completed",
+}
+
+
+class TestMapMessagesToResponseInput:
+    def test_system_developer_user_and_tool(self) -> None:
+        result = map_messages_to_response_input(
+            [
+                SystemMessage(content="Be terse."),
+                DeveloperMessage(content="Dev."),
+                UserMessage(content="Hi"),
+                ToolMessage(content="162 mg/dL", tool_call_id="call_1"),
+            ]
+        )
+        assert result == [
+            {"role": "system", "content": "Be terse."},
+            {"role": "developer", "content": "Dev."},
+            {"role": "user", "content": "Hi"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "162 mg/dL"},
+        ]
+
+    def test_user_parts_drop_cache_points(self) -> None:
+        result = map_messages_to_response_input(
+            [
+                UserMessage(
+                    content=[TextContent(text="Look"), CachePointContent(), ImageContent(url="https://x/i.png")]
+                ),
+                UserMessage(content=[CachePointContent()]),
+            ]
+        )
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Look"},
+                    {"type": "input_image", "image_url": "https://x/i.png", "detail": "auto"},
+                ],
+            }
+        ]
+
+    def test_assistant_without_continuation_is_rebuilt(self) -> None:
+        tc = ToolCall(id="call_1", function=FunctionCallResult(name="lab", arguments="{}"))
+        result = map_messages_to_response_input(
+            [
+                AssistantMessage(content="Checking.", tool_calls=[tc]),
+                AssistantMessage(content=None, tool_calls=None),
+            ]
+        )
+        assert result == [
+            {"role": "assistant", "content": "Checking."},
+            {"type": "function_call", "call_id": "call_1", "name": "lab", "arguments": "{}"},
+        ]
+
+    def test_assistant_with_continuation_replays_output(self) -> None:
+        continuation = ProviderContinuation(
+            namespace=CONTINUATION_NAMESPACE, data={"output": [REASONING_ITEM, CALL_ITEM]}
+        )
+        tc = ToolCall(id="call_1", function=FunctionCallResult(name="lab", arguments="{}"))
+        result = map_messages_to_response_input([AssistantMessage(tool_calls=[tc], continuation=continuation)])
+        assert result == [REASONING_ITEM, CALL_ITEM]
+
+    def test_foreign_continuation_is_ignored(self) -> None:
+        continuation = ProviderContinuation(namespace="lmux_anthropic.messages", data={"content": []})
+        result = map_messages_to_response_input([AssistantMessage(content="Hi", continuation=continuation)])
+        assert result == [{"role": "assistant", "content": "Hi"}]
+
+    def test_malformed_continuation_raises(self) -> None:
+        continuation = ProviderContinuation(namespace=CONTINUATION_NAMESPACE, data={"output": ["not an item"]})
+        with pytest.raises(InvalidRequestError, match="list of output items"):
+            map_messages_to_response_input([AssistantMessage(continuation=continuation)])
+
+
+class TestMapResponseTools:
+    def test_flat_function_tools_default_to_non_strict(self) -> None:
+        tools = [
+            Tool(function=FunctionDefinition(name="lab", description="Labs.", parameters={"type": "object"})),
+            Tool(function=FunctionDefinition(name="ping", strict=True)),
+        ]
+        assert map_response_tools(tools) == [
+            {
+                "type": "function",
+                "name": "lab",
+                "strict": False,
+                "description": "Labs.",
+                "parameters": {"type": "object"},
+            },
+            {"type": "function", "name": "ping", "strict": True},
+        ]
+
+
+class TestMapResponseToolChoice:
+    def test_function(self) -> None:
+        assert map_response_tool_choice(ToolChoiceFunction(name="lab")) == {"type": "function", "name": "lab"}
+
+    def test_literal(self) -> None:
+        assert map_response_tool_choice("required") == "required"
+
+
+class TestMapResponseTextFormat:
+    def test_text_and_json_object(self) -> None:
+        assert map_response_text_format(TextResponseFormat()) == {"type": "text"}
+        assert map_response_text_format(JsonObjectResponseFormat()) == {"type": "json_object"}
+
+    def test_json_schema(self) -> None:
+        rf = JsonSchemaResponseFormat(
+            name="out", json_schema={"type": "object", "properties": {}}, description="Out.", strict=True
+        )
+        assert map_response_text_format(rf) == {
+            "type": "json_schema",
+            "name": "out",
+            "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "description": "Out.",
+            "strict": True,
+        }
+
+    def test_json_schema_minimal(self) -> None:
+        rf = JsonSchemaResponseFormat(name="out", json_schema={"type": "object"})
+        assert map_response_text_format(rf) == {
+            "type": "json_schema",
+            "name": "out",
+            "schema": {"type": "object", "additionalProperties": False},
+        }
+
+
+class TestRejectStopForResponses:
+    def test_none_allowed(self) -> None:
+        reject_stop_for_responses(None)
+
+    def test_stop_rejected(self) -> None:
+        with pytest.raises(UnsupportedFeatureError, match="stop sequences"):
+            reject_stop_for_responses(["END"])
+
+
+class TestMapResponsesChat:
+    def test_reasoning_and_tool_call_keep_continuation(self) -> None:
+        reasoning = {
+            **REASONING_ITEM,
+            "summary": [{"type": "summary_text", "text": "Need LDL."}, {"type": "summary_text"}],
+        }
+        wire = WireResponsesResponse.model_validate(
+            {
+                "id": "resp_1",
+                "model": "gpt-6-luna",
+                "status": "completed",
+                "output": [reasoning, CALL_ITEM, {"type": "function_call", "call_id": None, "name": "x"}],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 3}},
+            }
+        )
+        result = map_responses_chat(wire, "azure-foundry", _noop_cost)
+        assert result == ChatResponse(
+            content=None,
+            reasoning="Need LDL.",
+            tool_calls=[ToolCall(id="call_1", function=FunctionCallResult(name="lab", arguments='{"analyte":"LDL"}'))],
+            usage=Usage(input_tokens=10, output_tokens=5, reasoning_tokens=3),
+            cost=Cost(input_cost=0.0, output_cost=0.0, total_cost=0.0),
+            model="gpt-6-luna",
+            provider="azure-foundry",
+            finish_reason="tool_calls",
+            continuation=ProviderContinuation(
+                namespace=CONTINUATION_NAMESPACE,
+                data={
+                    "output": [
+                        {
+                            **REASONING_ITEM,
+                            "summary": [{"type": "summary_text", "text": "Need LDL."}, {"type": "summary_text"}],
+                        },
+                        CALL_ITEM,
+                        {"type": "function_call", "name": "x"},
+                    ]
+                },
+            ),
+        )
+
+    def test_text_only_has_no_continuation(self) -> None:
+        wire = WireResponsesResponse.model_validate(
+            {
+                "id": "resp_2",
+                "model": "gpt-6-luna",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "Done."}]}],
+            }
+        )
+        result = map_responses_chat(wire, "azure-foundry", _noop_cost)
+        assert result == ChatResponse(
+            content="Done.", usage=None, cost=None, model="gpt-6-luna", provider="azure-foundry", finish_reason="stop"
+        )
+
+    @pytest.mark.parametrize(
+        ("details", "expected"),
+        [
+            ({"reason": "max_output_tokens"}, "length"),
+            ({"reason": "content_filter"}, "content_filter"),
+            ({"reason": "other"}, "other"),
+            (None, "incomplete"),
+        ],
+    )
+    def test_incomplete_reasons(self, details: dict[str, str] | None, expected: str) -> None:
+        wire = WireResponsesResponse.model_validate({
+            "id": "r", "model": "m", "status": "incomplete", "incomplete_details": details, "output": None,
+        })  # fmt: skip
+        assert map_responses_chat(wire, "azure-foundry", _none_cost).finish_reason == expected
+
+
+class TestResponsesStreamMapper:
+    def test_text_and_reasoning_deltas(self) -> None:
+        mapper = ResponsesStreamMapper("azure-foundry", _noop_cost)
+        assert mapper.map_event({"type": "response.output_text.delta", "delta": "Hi"}) == ChatChunk(
+            delta="Hi", provider="azure-foundry"
+        )
+        assert mapper.map_event({"type": "response.reasoning_summary_text.delta", "delta": "Hmm"}) == ChatChunk(
+            reasoning_delta="Hmm", provider="azure-foundry"
+        )
+
+    def test_function_calls_are_indexed_in_start_order(self) -> None:
+        mapper = ResponsesStreamMapper("azure-foundry", _noop_cost)
+        first = mapper.map_event(
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "function_call", "call_id": "call_a", "name": "lab", "arguments": ""},
+            }
+        )
+        second = mapper.map_event(
+            {
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {"type": "function_call", "call_id": "call_b", "name": "lab", "arguments": "{}"},
+            }
+        )
+        args = mapper.map_event({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": '{"a'})
+        assert first == ChatChunk(
+            tool_call_deltas=[
+                ToolCallDelta(index=0, id="call_a", type="function", function=FunctionCallDelta(name="lab"))
+            ],
+            provider="azure-foundry",
+        )
+        assert second == ChatChunk(
+            tool_call_deltas=[
+                ToolCallDelta(
+                    index=1, id="call_b", type="function", function=FunctionCallDelta(name="lab", arguments="{}")
+                )
+            ],
+            provider="azure-foundry",
+        )
+        assert args == ChatChunk(
+            tool_call_deltas=[ToolCallDelta(index=0, function=FunctionCallDelta(arguments='{"a'))],
+            provider="azure-foundry",
+        )
+
+    def test_ignored_events(self) -> None:
+        mapper = ResponsesStreamMapper("azure-foundry", _noop_cost)
+        assert mapper.map_event({"type": "response.created"}) is None
+        assert (
+            mapper.map_event({"type": "response.output_item.added", "output_index": 0, "item": {"type": "reasoning"}})
+            is None
+        )
+        assert (
+            mapper.map_event({"type": "response.function_call_arguments.delta", "output_index": 7, "delta": "x"})
+            is None
+        )
+
+    def test_terminal_event_carries_usage_cost_and_continuation(self) -> None:
+        mapper = ResponsesStreamMapper("azure-foundry", _noop_cost)
+        chunk = mapper.map_event(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "r",
+                    "model": "gpt-6-luna",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [REASONING_ITEM],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            }
+        )
+        assert chunk == ChatChunk(
+            usage=Usage(input_tokens=10, output_tokens=5),
+            cost=Cost(input_cost=0.0, output_cost=0.0, total_cost=0.0),
+            finish_reason="length",
+            model="gpt-6-luna",
+            provider="azure-foundry",
+            continuation=ProviderContinuation(namespace=CONTINUATION_NAMESPACE, data={"output": [REASONING_ITEM]}),
+        )
+
+
+class TestResponsesStreamError:
+    def test_error_event(self) -> None:
+        assert responses_stream_error({"type": "error", "code": "server_error", "message": "boom"}) == {
+            "error": {"message": "boom", "code": "server_error"}
+        }
+
+    def test_failed_response(self) -> None:
+        event = {"type": "response.failed", "response": {"error": {"code": "x", "message": "bad"}}}
+        assert responses_stream_error(event) == {"error": {"code": "x", "message": "bad"}}
+
+    def test_failed_response_without_error(self) -> None:
+        assert responses_stream_error({"type": "response.failed", "response": None}) == {
+            "error": {"message": "response failed"}
+        }
+
+    def test_other_events(self) -> None:
+        assert responses_stream_error({"type": "response.output_text.delta", "delta": "x"}) is None
