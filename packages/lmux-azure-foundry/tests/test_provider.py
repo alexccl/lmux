@@ -666,7 +666,11 @@ class TestChat:
         sync_provider.chat(
             "gpt-4o", [UserMessage(content="Hi")], provider_params=AzureFoundryParams(api="chat_completions")
         )
-        assert route.called
+        assert json.loads(route.calls.last.request.content) == {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False,
+        }
         assert not responses_route.called
 
     def test_responses_api_deployment_multiplier(
@@ -777,6 +781,7 @@ class TestAchat:
             tools=[Tool(function=FunctionDefinition(name="lab"))],
             tool_choice=ToolChoiceFunction(name="lab"),
             response_format=JsonObjectResponseFormat(),
+            reasoning_effort="low",
             provider_params=responses_params,
         )
         assert result == expected_tool_call_response

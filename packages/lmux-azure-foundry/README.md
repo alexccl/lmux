@@ -93,10 +93,13 @@ response = provider.chat("gpt-6-luna", messages, tools=tools, provider_params=pa
 messages.append(response.to_assistant_message())
 ```
 
-Requests are stateless (`store: false`). The model's encrypted reasoning comes back on
-`response.continuation`; keep it on the assistant message (as `to_assistant_message()` does) and the next
-call replays it. A continuation is only replayed on this path; the same history sent through Chat Completions drops
-the reasoning. `chat_stream`/`achat_stream` take the same parameter; `stop` and `seed` are not supported here.
+Requests are stateless (`store: false`) and always ask for encrypted reasoning, so use this with reasoning
+deployments. The encrypted reasoning comes back on `response.continuation`; keep it on the assistant message (as
+`to_assistant_message()` does) and the next call replays it. It is replayed to whichever Azure Foundry endpoint gets
+the history next, and only on this path; the same history sent through Chat Completions drops it. When a reasoning
+effort is set, the request also asks for reasoning summaries, which fill `response.reasoning` and
+`chunk.reasoning_delta`. `chat_stream`/`achat_stream` take the same parameter; `stop` and `seed` are not supported
+here.
 
 ### Async
 
